@@ -33,7 +33,7 @@ def _get_cascade():
         return None                      # 这个 opencv 构建里没有 objdetect 模块
 
     import os
-    candidates = []
+    candidates = [os.path.dirname(os.path.abspath(__file__))]   # 仓库里自带的副本
     try:
         candidates.append(cv2.data.haarcascades)
     except AttributeError:
@@ -95,14 +95,10 @@ def decode(image_bytes):
     """
     解码图片。先走 OpenCV；HEIC/HEIF 这类 OpenCV 不认的格式走 Pillow。
     """
-    arr = np.frombuffer(image_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is not None:
-        return img
-
-    # OpenCV 读不了，试 Pillow（配合 pillow-heif 就能读 iPhone 的 HEIC）
+    # 先走 Pillow：它能读 EXIF 的方向标记，手机竖拍的照片才不会躺着进来。
+    # OpenCV 的 imdecode 完全忽略 EXIF，所以不能拿它当第一选择。
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
         try:
             import pillow_heif
             pillow_heif.register_heif_opener()
@@ -111,10 +107,19 @@ def decode(image_bytes):
 
         import io as _io
         pil = Image.open(_io.BytesIO(image_bytes))
+        pil = ImageOps.exif_transpose(pil)     # 按 EXIF 自动转正
         pil = pil.convert("RGB")
         return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-    except Exception as e:
-        raise ValueError(f"无法解码这个格式（{e}）") from None
+    except Exception:
+        pass
+
+    # Pillow 读不了才退回 OpenCV
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is not None:
+        return img
+
+    raise ValueError("无法解码这个格式")
 
 
 def crop_face(img):
