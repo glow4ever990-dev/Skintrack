@@ -17,9 +17,30 @@ FACE_SIZE = 512          # 所有脸统一缩放到这个尺寸，等于做了�
 REGIONS = ["额头", "眼周", "鼻部", "左脸颊", "右脸颊", "嘴周", "下颌"]
 METRICS = ["粗糙度", "肤色不匀", "泛红度", "斑点占比", "反光度"]
 
-_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+_cascade = None
+
+def _get_cascade():
+    global _cascade
+    if _cascade is None:
+        try:
+            path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        except AttributeError:
+            # opencv-python-headless 某些版本没有 cv2.data
+            import os
+            for d in [
+                "/usr/share/opencv4/haarcascades",
+                "/usr/share/opencv/haarcascades",
+                "/usr/local/share/opencv4/haarcascades",
+                os.path.join(os.path.dirname(cv2.__file__), "data"),
+            ]:
+                p = os.path.join(d, "haarcascade_frontalface_default.xml")
+                if os.path.isfile(p):
+                    path = p
+                    break
+            else:
+                path = "haarcascade_frontalface_default.xml"
+        _cascade = cv2.CascadeClassifier(path)
+    return _cascade
 
 
 # ---------------- 日期解析 ----------------
@@ -71,7 +92,7 @@ def crop_face(img):
                        interpolation=cv2.INTER_AREA) if scale < 1 else img
 
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    faces = _cascade.detectMultiScale(gray, 1.15, 5, minSize=(60, 60))
+    faces = _get_cascade().detectMultiScale(gray, 1.15, 5, minSize=(60, 60))
 
     if len(faces):
         x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
