@@ -17,30 +17,49 @@ FACE_SIZE = 512          # 所有脸统一缩放到这个尺寸，等于做了�
 REGIONS = ["额头", "眼周", "鼻部", "左脸颊", "右脸颊", "嘴周", "下颌"]
 METRICS = ["粗糙度", "肤色不匀", "泛红度", "斑点占比", "反光度"]
 
-_cascade = None
+_cascade = "uninit"          # "uninit" = 还没试过；None = 试过但不可用
 
 def _get_cascade():
+    """
+    取人脸检测器。取不到就返回 None——调用方会退回中心裁剪，
+    整个流程不会因此中断。
+    """
     global _cascade
-    if _cascade is None:
-        try:
-            path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        except AttributeError:
-            # opencv-python-headless 某些版本没有 cv2.data
-            import os
-            for d in [
-                "/usr/share/opencv4/haarcascades",
-                "/usr/share/opencv/haarcascades",
-                "/usr/local/share/opencv4/haarcascades",
-                os.path.join(os.path.dirname(cv2.__file__), "data"),
-            ]:
-                p = os.path.join(d, "haarcascade_frontalface_default.xml")
-                if os.path.isfile(p):
-                    path = p
+    if _cascade != "uninit":
+        return _cascade
+
+    _cascade = None
+    if not hasattr(cv2, "CascadeClassifier"):
+        return None                      # 这个 opencv 构建里没有 objdetect 模块
+
+    import os
+    candidates = []
+    try:
+        candidates.append(cv2.data.haarcascades)
+    except AttributeError:
+        pass
+    candidates += [
+        os.path.join(os.path.dirname(cv2.__file__), "data"),
+        "/usr/share/opencv4/haarcascades",
+        "/usr/share/opencv/haarcascades",
+        "/usr/local/share/opencv4/haarcascades",
+    ]
+
+    for d in candidates:
+        p = os.path.join(d, "haarcascade_frontalface_default.xml")
+        if os.path.isfile(p):
+            try:
+                c = cv2.CascadeClassifier(p)
+                if not c.empty():
+                    _cascade = c
                     break
-            else:
-                path = "haarcascade_frontalface_default.xml"
-        _cascade = cv2.CascadeClassifier(path)
+            except Exception:
+                continue
     return _cascade
+
+
+def face_detection_available():
+    return _get_cascade() is not None
 
 
 # ---------------- 日期解析 ----------------
@@ -73,11 +92,29 @@ def parse_date(drive_file):
 
 # ---------------- 解码 + 裁脸 + 归一化 ----------------
 def decode(image_bytes):
+    """
+    解码图片。先走 OpenCV；HEIC/HEIF 这类 OpenCV 不认的格式走 Pillow。
+    """
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("图片解码失败（HEIC 格式请先转成 JPG）")
-    return img
+    if img is not None:
+        return img
+
+    # OpenCV 读不了，试 Pillow（配合 pillow-heif 就能读 iPhone 的 HEIC）
+    try:
+        from PIL import Image
+        try:
+            import pillow_heif
+            pillow_heif.register_heif_opener()
+        except ImportError:
+            pass
+
+        import io as _io
+        pil = Image.open(_io.BytesIO(image_bytes))
+        pil = pil.convert("RGB")
+        return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        raise ValueError(f"无法解码这个格式（{e}）") from None
 
 
 def crop_face(img):
@@ -91,8 +128,14 @@ def crop_face(img):
     small = cv2.resize(img, (int(w * scale), int(h * scale)),
                        interpolation=cv2.INTER_AREA) if scale < 1 else img
 
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    faces = _get_cascade().detectMultiScale(gray, 1.15, 5, minSize=(60, 60))
+    faces = []
+    casc = _get_cascade()
+    if casc is not None:
+        try:
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            faces = casc.detectMultiScale(gray, 1.15, 5, minSize=(60, 60))
+        except Exception:
+            faces = []
 
     if len(faces):
         x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])

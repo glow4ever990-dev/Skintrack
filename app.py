@@ -139,6 +139,9 @@ with st.sidebar:
         st.session_state.df = sync(client, folder_id(), df, csv_id)
         df = st.session_state.df
     st.caption(f"已收录 {df['file_id'].nunique() if len(df) else 0} 张照片")
+    if not sm.face_detection_available():
+        st.warning("人脸自动定位不可用，改用中心裁剪。"
+                   "请尽量让脸在画面正中、大小一致，否则数据不可比。")
     if len(df):
         st.download_button("下载全部数据 (CSV)",
                            df.to_csv(index=False).encode("utf-8-sig"),
