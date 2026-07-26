@@ -16,7 +16,8 @@ import skin_metrics as sm
 from drive_client import DriveClient
 
 METRICS_FILE = "skin_metrics.csv"
-COLS = ["file_id", "name", "date", "region", "metric", "value"]
+COLS = ["person", "file_id", "name", "date", "region", "metric", "value"]
+UNGROUPED = "未分组"
 
 # 方向：+1 表示数值变大 = 变差；-1 表示数值变大 = 变好
 WORSE_IF_UP = {
@@ -53,8 +54,11 @@ def load_metrics(client, fid):
         if not txt.strip():
             return pd.DataFrame(columns=COLS), file_id
         df = pd.read_csv(io.StringIO(txt))
+        if "person" not in df.columns:      # 旧表没有分人，全部归到未分组
+            df["person"] = UNGROUPED
+        df["person"] = df["person"].fillna(UNGROUPED)
         df["date"] = pd.to_datetime(df["date"])
-        return df, file_id
+        return df[COLS], file_id
     except Exception:
         return pd.DataFrame(columns=COLS), file_id
 
@@ -70,15 +74,19 @@ def save_metrics(client, df, file_id):
 
 # ---------------- 同步 ----------------
 def sync(client, fid, df, csv_id):
-    files = client.list_images(fid)
-    if not files:
+    groups = client.list_images_by_person(fid)
+    if not groups:
         st.warning("文件夹里没找到图片。检查一下文件夹 ID，以及是否已经共享给服务账号。")
         return df
 
-    done = set(df["file_id"].unique()) if len(df) else set()
-    todo = [f for f in files if f["id"] not in done]
+    # 拉平成 (人名, 文件) 的列表
+    files = [(person, f) for person, imgs in groups for f in imgs]
 
-    st.info(f"云端共 {len(files)} 张，已分析 {len(done)} 张，本次需要处理 {len(todo)} 张。")
+    done = set(df["file_id"].unique()) if len(df) else set()
+    todo = [(p, f) for p, f in files if f["id"] not in done]
+
+    st.info(f"共 {len(groups)} 个对象、{len(files)} 张照片，"
+            f"已分析 {len(done)} 张，本次需要处理 {len(todo)} 张。")
     if not todo:
         return df
 
@@ -86,18 +94,18 @@ def sync(client, fid, df, csv_id):
     status = st.empty()
     rows, failed = [], []
 
-    for i, f in enumerate(todo):
-        status.text(f"处理中：{f['name']}  ({i + 1}/{len(todo)})")
+    for i, (person, f) in enumerate(todo):
+        status.text(f"处理中：{person} / {f['name']}  ({i + 1}/{len(todo)})")
         try:
             raw = client.fetch_image_bytes(f)
             res = sm.analyze(raw)
             d = sm.parse_date(f)
             for region, mets in res["regions"].items():
                 for metric, val in mets.items():
-                    rows.append([f["id"], f["name"], d, region, metric, val])
+                    rows.append([person, f["id"], f["name"], d, region, metric, val])
             del raw, res          # 立刻释放，内存里始终只有一张图
         except Exception as e:
-            failed.append(f"{f['name']}：{e}")
+            failed.append(f"{person} / {f['name']}：{e}")
         bar.progress((i + 1) / len(todo))
 
     status.empty()
@@ -150,6 +158,27 @@ with st.sidebar:
 if not len(df):
     st.info("左边点「扫描 Drive 并分析新照片」开始。")
     st.stop()
+
+# ---------------- 选对象 ----------------
+# 每个人一个子文件夹。不选人的话，不同人的照片会混在一起比，结果毫无意义。
+if "person" not in df.columns:
+    df["person"] = UNGROUPED
+people = sorted(df["person"].dropna().unique().tolist())
+
+if len(people) > 1:
+    person = st.sidebar.selectbox("选择对象", people, key="person_sel")
+else:
+    person = people[0]
+    st.sidebar.caption(f"当前对象：{person}")
+
+df = df[df["person"] == person]
+
+if not len(df):
+    st.info("这个对象名下还没有已分析的照片。")
+    st.stop()
+
+st.caption(f"当前对象：**{person}**　共 {df['file_id'].nunique()} 张照片"
+           + ("　（只在同一对象内部对比）" if len(people) > 1 else ""))
 
 photos = (df.groupby(["file_id", "name"])["date"].first()
             .reset_index().sort_values("date"))
@@ -256,29 +285,58 @@ with tab3:
     a = c1.selectbox("前期", opts, index=0, format_func=fmt, key="pa")
     b = c2.selectbox("后期", opts, index=len(opts) - 1, format_func=fmt, key="pb")
 
+    top_n = st.slider("标出几个差异区块", 1, 5, 3, key="topn")
+
     if st.button("开始对比", type="primary"):
         with st.spinner("下载并对比中..."):
-            files = client.list_images(folder_id())
-            fmap = {f["id"]: f for f in files}
+            fmap = {f["id"]: f
+                    for _p, imgs in client.list_images_by_person(folder_id())
+                    for f in imgs}
             try:
                 ba = client.fetch_image_bytes(fmap[a])
                 bb = client.fetch_image_bytes(fmap[b])
-                heat, overlay, boxed, side, per = sm.pairwise_diff(ba, bb)
+                r = sm.comparison_image(ba, bb, top=top_n)
 
-                st.image(sm.bgr_to_rgb(side), caption="左：前期　右：后期（已对齐）",
-                         use_container_width=True)
-                c1, c2, c3 = st.columns(3)
-                c1.image(sm.bgr_to_rgb(heat), caption="差异热力图（红=差异大）",
-                         use_container_width=True)
-                c2.image(sm.bgr_to_rgb(overlay), caption="热力图叠加",
-                         use_container_width=True)
-                c3.image(sm.bgr_to_rgb(boxed), caption="差异集中区块",
+                # ---- 先说清楚这次对齐得怎么样，不准就别信结果 ----
+                names = {"eyes": "两眼精确对齐", "face": "只对上脸框",
+                         "center": "没检测到脸"}
+                la, lb = r["level_a"], r["level_b"]
+                if r["comparable"]:
+                    st.success(f"对齐良好（前：{names[la]}，后：{names[lb]}）"
+                               + ("，并已做亚像素微调" if r["refined"] else ""))
+                else:
+                    st.warning(
+                        f"对齐不理想 —— 前：{names[la]}，后：{names[lb]}。"
+                        "下面标出的区块可能只是没对齐造成的假差异，别当真。"
+                        "重拍时正对镜头、露出双眼、别戴反光的眼镜，就能对上。")
+
+                st.image(sm.bgr_to_rgb(r["merged"]),
+                         caption="上排：前期 ｜ 后期 ｜ 差异热力（白框内为差异最集中处）　"
+                                 "下排：各标号的局部放大，左前右后",
                          use_container_width=True)
 
-                st.dataframe(
-                    pd.DataFrame(sorted(per.items(), key=lambda x: -x[1]),
-                                 columns=["区域", "平均差异"]),
-                    use_container_width=True, hide_index=True)
+                st.download_button("下载这张对比图",
+                                   sm.to_png_bytes(r["merged"]),
+                                   file_name="对比图.png", mime="image/png")
+
+                if r["blocks"]:
+                    st.markdown("**差异集中区块**")
+                    st.dataframe(
+                        pd.DataFrame(
+                            [{"标号": i, "部位": b_["region"],
+                              "差异强度": round(b_["score"], 2)}
+                             for i, b_ in enumerate(r["blocks"], 1)]),
+                        use_container_width=True, hide_index=True)
+                else:
+                    st.info("没找出明显集中的差异区块，两张照片整体比较接近。")
+
+                with st.expander("按区域看平均差异"):
+                    st.dataframe(
+                        pd.DataFrame(sorted(r["per_region"].items(),
+                                            key=lambda x: -x[1]),
+                                     columns=["区域", "平均差异"]),
+                        use_container_width=True, hide_index=True)
+
             except Exception as e:
                 st.error(f"对比失败：{e}")
 

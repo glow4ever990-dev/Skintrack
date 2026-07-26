@@ -17,45 +17,47 @@ FACE_SIZE = 512          # 所有脸统一缩放到这个尺寸，等于做了�
 REGIONS = ["额头", "眼周", "鼻部", "左脸颊", "右脸颊", "嘴周", "下颌"]
 METRICS = ["粗糙度", "肤色不匀", "泛红度", "斑点占比", "反光度"]
 
-_cascade = "uninit"          # "uninit" = 还没试过；None = 试过但不可用
+_cascades = {}          # 文件名 -> 分类器 / None
 
-def _get_cascade():
-    """
-    取人脸检测器。取不到就返回 None——调用方会退回中心裁剪，
-    整个流程不会因此中断。
-    """
-    global _cascade
-    if _cascade != "uninit":
-        return _cascade
-
-    _cascade = None
-    if not hasattr(cv2, "CascadeClassifier"):
-        return None                      # 这个 opencv 构建里没有 objdetect 模块
-
+def _cascade_dirs():
     import os
-    candidates = [os.path.dirname(os.path.abspath(__file__))]   # 仓库里自带的副本
+    dirs = [os.path.dirname(os.path.abspath(__file__))]   # 仓库里自带的副本优先
     try:
-        candidates.append(cv2.data.haarcascades)
+        dirs.append(cv2.data.haarcascades)
     except AttributeError:
         pass
-    candidates += [
+    dirs += [
         os.path.join(os.path.dirname(cv2.__file__), "data"),
         "/usr/share/opencv4/haarcascades",
         "/usr/share/opencv/haarcascades",
         "/usr/local/share/opencv4/haarcascades",
     ]
+    return dirs
 
-    for d in candidates:
-        p = os.path.join(d, "haarcascade_frontalface_default.xml")
+
+def _get_cascade(name="haarcascade_frontalface_default.xml"):
+    """
+    取某个检测器。取不到返回 None，调用方自己降级，流程不中断。
+    """
+    if name in _cascades:
+        return _cascades[name]
+
+    _cascades[name] = None
+    if not hasattr(cv2, "CascadeClassifier"):
+        return None                      # 这个 opencv 构建里没有 objdetect
+
+    import os
+    for d in _cascade_dirs():
+        p = os.path.join(d, name)
         if os.path.isfile(p):
             try:
                 c = cv2.CascadeClassifier(p)
                 if not c.empty():
-                    _cascade = c
+                    _cascades[name] = c
                     break
             except Exception:
                 continue
-    return _cascade
+    return _cascades[name]
 
 
 def face_detection_available():
@@ -122,51 +124,153 @@ def decode(image_bytes):
     raise ValueError("无法解码这个格式")
 
 
-def crop_face(img):
+# ---------------- 对齐 ----------------
+# 标准脸的几何：所有照片都被摆成两眼在这两个固定坐标上。
+# 这样近景、远景、脸偏一点、头歪一点，出来都是同一个姿态。
+EYE_Y   = 0.36      # 眼睛所在的高度（占画布比例）
+EYE_LX  = 0.33      # 画面左边那只眼的横坐标
+EYE_RX  = 0.67      # 画面右边那只眼的横坐标
+
+
+def _find_face(gray):
+    casc = _get_cascade()
+    if casc is None:
+        return None
+    try:
+        faces = casc.detectMultiScale(gray, 1.15, 5, minSize=(60, 60))
+    except Exception:
+        return None
+    if not len(faces):
+        return None
+    return max(faces, key=lambda f: f[2] * f[3])
+
+
+def _find_eyes(gray, face_rect):
     """
-    裁出人脸并统一到 FACE_SIZE。
-    统一尺寸 = 不同日期的照片大致对齐，同一区域落在同一位置。
-    返回 (脸图, 是否检测到人脸)
+    在人脸框的上半部分找两只眼睛，按左右分开各取一个。
+    找不齐两只就返回 None。
+    """
+    x, y, w, h = face_rect
+    # 眼睛只可能在脸的上 2/3，限定范围能少一大堆误检（鼻孔、嘴角很容易被当成眼）
+    ty, by = y + int(h * 0.16), y + int(h * 0.62)
+    roi = gray[max(0, ty):by, x:x + w]
+    if roi.size == 0:
+        return None
+
+    found = []
+    for name in ("haarcascade_eye_tree_eyeglasses.xml", "haarcascade_eye.xml"):
+        casc = _get_cascade(name)
+        if casc is None:
+            continue
+        try:
+            eyes = casc.detectMultiScale(roi, 1.12, 6,
+                                         minSize=(int(w * 0.10), int(w * 0.10)),
+                                         maxSize=(int(w * 0.45), int(w * 0.45)))
+        except Exception:
+            eyes = []
+        if len(eyes) >= 2:
+            found = eyes
+            break
+        if len(eyes) and not len(found):
+            found = eyes
+
+    if len(found) < 2:
+        return None
+
+    mid = roi.shape[1] / 2.0
+    cents = [(ex + ew / 2.0, ey + eh / 2.0, ew * eh) for ex, ey, ew, eh in found]
+    left  = [c for c in cents if c[0] <  mid]
+    right = [c for c in cents if c[0] >= mid]
+    if not left or not right:
+        return None
+
+    # 每侧取面积最大的那个（通常就是真眼睛）
+    lx, ly, _ = max(left,  key=lambda c: c[2])
+    rx, ry, _ = max(right, key=lambda c: c[2])
+
+    # 换回整图坐标
+    off_y = max(0, ty)
+    return (lx + x, ly + off_y), (rx + x, ry + off_y)
+
+
+def align_face(img, size=FACE_SIZE):
+    """
+    把脸摆正到统一姿态，返回 (脸图, 对齐等级)。
+
+    等级三档，越靠前越准：
+      "eyes"   两眼定位成功——旋转/缩放/平移全部校正，不同远近的照片可以直接比
+      "face"   只找到脸框——大小位置大致统一，但没校正角度
+      "center" 什么都没找到——只能取画面中心，基本不可比
     """
     h, w = img.shape[:2]
-    scale = min(1.0, 900 / max(h, w))
+    scale = min(1.0, 1100 / max(h, w))
     small = cv2.resize(img, (int(w * scale), int(h * scale)),
                        interpolation=cv2.INTER_AREA) if scale < 1 else img
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)          # 拉对比度，暗光照片也能检出
 
-    faces = []
-    casc = _get_cascade()
-    if casc is not None:
-        try:
-            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            faces = casc.detectMultiScale(gray, 1.15, 5, minSize=(60, 60))
-        except Exception:
-            faces = []
+    face = _find_face(gray)
 
-    if len(faces):
-        x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-        # 稍微放大范围，把额头和下巴包进来
+    # ---- 第一档：靠两眼做相似变换 ----
+    if face is not None:
+        eyes = _find_eyes(gray, face)
+        if eyes is not None:
+            (lx, ly), (rx, ry) = eyes
+            dx, dy = rx - lx, ry - ly
+            dist = float(np.hypot(dx, dy))
+            if dist > 1:
+                target = (EYE_RX - EYE_LX) * size
+                angle = float(np.degrees(np.arctan2(dy, dx)))
+                M = cv2.getRotationMatrix2D(((lx + rx) / 2.0, (ly + ry) / 2.0),
+                                            angle, target / dist)
+                # 把两眼中点搬到画布上的固定位置
+                M[0, 2] += (EYE_LX + EYE_RX) / 2.0 * size - (lx + rx) / 2.0
+                M[1, 2] += EYE_Y * size - (ly + ry) / 2.0
+                out = cv2.warpAffine(small, M, (size, size),
+                                     flags=cv2.INTER_AREA,
+                                     borderMode=cv2.BORDER_REPLICATE)
+                return out, "eyes"
+
+    # ---- 第二档：只有脸框 ----
+    if face is not None:
+        x, y, fw, fh = face
         cx, cy = x + fw / 2, y + fh / 2
         side = max(fw, fh) * 1.45
         x1, y1 = int(cx - side / 2), int(cy - side / 2 - side * 0.05)
-        x2, y2 = int(x1 + side), int(y1 + side)
-        detected = True
+        level = "face"
     else:
-        # 没检测到脸就取中间的正方形
+        # ---- 第三档：中心裁剪 ----
         side = min(small.shape[:2])
         x1 = (small.shape[1] - side) // 2
         y1 = (small.shape[0] - side) // 2
-        x2, y2 = x1 + side, y1 + side
-        detected = False
+        level = "center"
 
+    x2, y2 = int(x1 + side), int(y1 + side)
     pad = max(0, -x1, -y1, x2 - small.shape[1], y2 - small.shape[0])
     if pad:
-        small = cv2.copyMakeBorder(small, pad, pad, pad, pad,
-                                   cv2.BORDER_REPLICATE)
+        small = cv2.copyMakeBorder(small, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
         x1, y1, x2, y2 = x1 + pad, y1 + pad, x2 + pad, y2 + pad
 
-    face = small[y1:y2, x1:x2]
-    face = cv2.resize(face, (FACE_SIZE, FACE_SIZE), interpolation=cv2.INTER_AREA)
-    return face, detected
+    out = cv2.resize(small[y1:y2, x1:x2], (size, size), interpolation=cv2.INTER_AREA)
+    return out, level
+
+
+def crop_face(img):
+    """老接口，保留兼容：返回 (脸图, 是否检测到脸)。"""
+    face, level = align_face(img)
+    return face, level != "center"
+
+
+def face_mask(size=FACE_SIZE):
+    """
+    椭圆脸罩。背景、头发、衣领的差异远大于皮肤，不挡掉的话
+    差异图上全是它们，真正的皮肤变化会被淹没。
+    """
+    m = np.zeros((size, size), np.float32)
+    cv2.ellipse(m, (size // 2, int(size * 0.55)),
+                (int(size * 0.34), int(size * 0.45)),
+                0, 0, 360, 1.0, -1)
+    return cv2.GaussianBlur(m, (0, 0), size * 0.02)
 
 
 def normalize_light(face):
@@ -182,15 +286,21 @@ def normalize_light(face):
 
 # ---------------- 区域划分 ----------------
 def region_boxes(size=FACE_SIZE):
+    """
+    区域坐标是按"两眼固定在 EYE_Y 高度"这个标准姿态标定的。
+    对齐等级到了 eyes，这些框才真正落在对应的部位上。
+    """
     s = size
+    def box(x1, y1, x2, y2):
+        return (int(x1 * s), int(y1 * s), int(x2 * s), int(y2 * s))
     return {
-        "额头":   (int(.20 * s), int(.10 * s), int(.80 * s), int(.28 * s)),
-        "眼周":   (int(.14 * s), int(.30 * s), int(.86 * s), int(.46 * s)),
-        "鼻部":   (int(.40 * s), int(.42 * s), int(.60 * s), int(.66 * s)),
-        "左脸颊": (int(.13 * s), int(.46 * s), int(.36 * s), int(.72 * s)),
-        "右脸颊": (int(.64 * s), int(.46 * s), int(.87 * s), int(.72 * s)),
-        "嘴周":   (int(.33 * s), int(.66 * s), int(.67 * s), int(.82 * s)),
-        "下颌":   (int(.22 * s), int(.80 * s), int(.78 * s), int(.94 * s)),
+        "额头":   box(.28, .07, .72, .25),
+        "眼周":   box(.20, .28, .80, .44),
+        "鼻部":   box(.42, .40, .58, .67),
+        "左脸颊": box(.19, .45, .38, .70),
+        "右脸颊": box(.62, .45, .81, .70),
+        "嘴周":   box(.34, .70, .66, .84),
+        "下颌":   box(.26, .84, .74, .96),
     }
 
 
@@ -255,41 +365,192 @@ def analyze(image_bytes):
 
 
 # ---------------- 两张图的直接对比（找茬模式） ----------------
-def pairwise_diff(bytes_a, bytes_b):
-    """返回 (热力图, 叠加图, 并排图, 分区差异 dict)"""
-    fa, _ = crop_face(decode(bytes_a))
-    fb, _ = crop_face(decode(bytes_b))
+def _match_illumination(a, b, mask):
+    """
+    把 b 的亮度分布拉到跟 a 一致。灯光不同造成的整体明暗差
+    会盖过真实的皮肤变化，先扣掉这一层。
+    只能修整体差异，修不了侧光、阴影方向不同这类问题。
+    """
+    la = cv2.cvtColor(a, cv2.COLOR_BGR2LAB).astype(np.float32)
+    lb = cv2.cvtColor(b, cv2.COLOR_BGR2LAB).astype(np.float32)
+    m = mask > 0.5
+    if m.sum() < 100:
+        return la, lb
+    for c in range(3):
+        ma, sa = la[:, :, c][m].mean(), la[:, :, c][m].std() + 1e-6
+        mb, sb = lb[:, :, c][m].mean(), lb[:, :, c][m].std() + 1e-6
+        lb[:, :, c] = (lb[:, :, c] - mb) / sb * sa + ma
+    return la, lb
 
-    la = normalize_light(fa)
-    lb = normalize_light(fb)
 
-    diff = np.sqrt(np.sum((la - lb) ** 2, axis=2))
-    diff = cv2.GaussianBlur(diff, (5, 5), 0)
+def _refine_align(ref, mov):
+    """
+    眼睛对齐之后还会剩一点点位移，用 ECC 再磨一次。
+    这一步很关键：差一两个像素，鼻翼、发际线的边缘就会在差异图上
+    亮成一条，看起来像"这里变了"，其实只是没对齐。
+    对不上就原样返回，不影响后续。
+    """
+    try:
+        ga = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        gb = cv2.cvtColor(mov, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        ga = cv2.GaussianBlur(ga, (0, 0), 2.0)
+        gb = cv2.GaussianBlur(gb, (0, 0), 2.0)
+        warp = np.eye(2, 3, dtype=np.float32)
+        crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5)
+        cv2.findTransformECC(ga, gb, warp, cv2.MOTION_EUCLIDEAN, crit, None, 5)
+        return cv2.warpAffine(mov, warp, mov.shape[1::-1],
+                              flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
+                              borderMode=cv2.BORDER_REPLICATE), True
+    except Exception:
+        return mov, False
 
-    hi = np.percentile(diff, 99) + 1e-6
-    norm = np.clip(diff / hi, 0, 1)
+
+def diff_map(bytes_a, bytes_b):
+    """
+    算两张照片的差异分布。返回一个 dict，后面画图和排名都用它。
+    """
+    fa, lvl_a = align_face(decode(bytes_a))
+    fb, lvl_b = align_face(decode(bytes_b))
+
+    fb, refined = _refine_align(fa, fb)
+
+    mask = face_mask()
+    la, lb = _match_illumination(fa, fb, mask)
+
+    # 差异本身
+    d = np.sqrt(np.sum((la - lb) ** 2, axis=2))
+
+    # 边缘抑制：头发丝、睫毛、嘴唇轮廓这些地方，只要差半个像素
+    # 差异值就爆表。按梯度强度给这些位置降权，剩下的才是皮肤上的变化。
+    g = cv2.cvtColor(fa, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    grad = cv2.GaussianBlur(np.hypot(gx, gy), (0, 0), 2.0)
+    w_edge = 1.0 / (1.0 + (grad / 18.0) ** 2)
+
+    d = cv2.GaussianBlur(d, (0, 0), 3.0) * w_edge * mask
+
+    return {
+        "face_a": fa, "face_b": fb,
+        "diff": d, "mask": mask,
+        "level_a": lvl_a, "level_b": lvl_b,
+        "refined": refined,
+        "comparable": lvl_a == "eyes" and lvl_b == "eyes",
+    }
+
+
+def hot_blocks(d, mask, top=3, grid=16, min_gap=2):
+    """
+    把脸切成小格，找差异最集中的几块。
+    比找轮廓稳得多——轮廓法会因为阈值一点点变化就框出完全不同的形状。
+    """
+    S = d.shape[0]
+    cell = S // grid
+    score = np.zeros((grid, grid), np.float32)
+    for i in range(grid):
+        for j in range(grid):
+            sub = d[i * cell:(i + 1) * cell, j * cell:(j + 1) * cell]
+            sm  = mask[i * cell:(i + 1) * cell, j * cell:(j + 1) * cell]
+            score[i, j] = sub.mean() if sm.mean() > 0.6 else 0.0
+
+    picked = []
+    s = score.copy()
+    for _ in range(top):
+        i, j = np.unravel_index(int(s.argmax()), s.shape)
+        if s[i, j] <= 0:
+            break
+        picked.append((i, j, float(s[i, j])))
+        # 压掉周围，免得三个框全挤在一起
+        s[max(0, i - min_gap):i + min_gap + 1,
+          max(0, j - min_gap):j + min_gap + 1] = 0
+
+    boxes = []
+    for i, j, v in picked:
+        pad = cell // 2
+        x1 = max(0, j * cell - pad); y1 = max(0, i * cell - pad)
+        x2 = min(S, (j + 1) * cell + pad); y2 = min(S, (i + 1) * cell + pad)
+        boxes.append({"box": (x1, y1, x2, y2), "score": v,
+                      "region": _which_region((x1 + x2) // 2, (y1 + y2) // 2)})
+    return boxes
+
+
+def _which_region(cx, cy):
+    for name, (x1, y1, x2, y2) in region_boxes().items():
+        if x1 <= cx < x2 and y1 <= cy < y2:
+            return name
+    return "其他"
+
+
+def comparison_image(bytes_a, bytes_b, top=3):
+    """
+    出一张合并好的对比图：
+      上排  前 | 后 | 热力叠加（差异最大的几块用白框标 1 2 3）
+      下排  每个标号处的局部放大，左边是前、右边是后
+    图上只写数字，中文说明留给界面——图片里画中文要额外装字体，
+    在 Streamlit Cloud 上很容易缺字变成方块。
+    """
+    r = diff_map(bytes_a, bytes_b)
+    fa, fb, d, mask = r["face_a"], r["face_b"], r["diff"], r["mask"]
+    S = fa.shape[0]
+
+    hi = np.percentile(d[mask > 0.5], 99.0) + 1e-6
+    norm = np.clip(d / hi, 0, 1)
     heat = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    overlay = cv2.addWeighted(fb, 0.55, heat, 0.45, 0)
+    heat = (heat * mask[:, :, None]).astype(np.uint8)
+    overlay = cv2.addWeighted(fb, 0.6, heat, 0.4, 0)
 
-    # 差异最集中的区块画红框
-    mask = (norm > 0.55).astype(np.uint8) * 255
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxed = fb.copy()
-    for c in cnts:
-        if cv2.contourArea(c) < 150:
-            continue
-        x, y, w, h = cv2.boundingRect(c)
-        cv2.rectangle(boxed, (x, y), (x + w, y + h), (0, 0, 255), 2)
+    blocks = hot_blocks(d, mask, top=top)
+
+    marked = overlay.copy()
+    for n, b in enumerate(blocks, 1):
+        x1, y1, x2, y2 = b["box"]
+        cv2.rectangle(marked, (x1, y1), (x2, y2), (255, 255, 255), 2)
+        cv2.putText(marked, str(n), (x1 + 4, max(16, y1 + 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+    top_row = np.hstack([fa, fb, marked])
+
+    # 下排：局部放大
+    if blocks:
+        crop_h = S // 2
+        tiles = []
+        for n, b in enumerate(blocks, 1):
+            x1, y1, x2, y2 = b["box"]
+            ca = cv2.resize(fa[y1:y2, x1:x2], (crop_h, crop_h), interpolation=cv2.INTER_CUBIC)
+            cb = cv2.resize(fb[y1:y2, x1:x2], (crop_h, crop_h), interpolation=cv2.INTER_CUBIC)
+            pair = np.hstack([ca, np.full((crop_h, 4, 3), 255, np.uint8), cb])
+            cv2.putText(pair, str(n), (6, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            tiles.append(pair)
+            tiles.append(np.full((crop_h, 10, 3), 255, np.uint8))
+        bottom = np.hstack(tiles[:-1])
+        pad_w = top_row.shape[1] - bottom.shape[1]
+        if pad_w > 0:
+            bottom = np.hstack([bottom, np.full((bottom.shape[0], pad_w, 3), 255, np.uint8)])
+        elif pad_w < 0:
+            bottom = cv2.resize(bottom, (top_row.shape[1],
+                                         int(bottom.shape[0] * top_row.shape[1] / bottom.shape[1])))
+        gap = np.full((12, top_row.shape[1], 3), 255, np.uint8)
+        merged = np.vstack([top_row, gap, bottom])
+    else:
+        merged = top_row
 
     per_region = {}
     for name, (x1, y1, x2, y2) in region_boxes().items():
-        patch = diff[y1:y2, x1:x2]
+        patch = d[y1:y2, x1:x2]
         if patch.size:
             per_region[name] = round(float(patch.mean()), 2)
 
-    side = np.hstack([fa, fb])
-    return heat, overlay, boxed, side, per_region
+    r.update({"heat": heat, "overlay": overlay, "marked": marked,
+              "side": np.hstack([fa, fb]), "merged": merged,
+              "blocks": blocks, "per_region": per_region})
+    return r
+
+
+def pairwise_diff(bytes_a, bytes_b):
+    """老接口，保留兼容。"""
+    r = comparison_image(bytes_a, bytes_b)
+    return r["heat"], r["overlay"], r["marked"], r["side"], r["per_region"]
 
 
 def to_png_bytes(img_bgr):

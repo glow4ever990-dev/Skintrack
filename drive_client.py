@@ -55,6 +55,40 @@ class DriveClient:
                 break
         return files
 
+    # ---------- 列出子文件夹（每人一个） ----------
+    def list_subfolders(self, folder_id):
+        """列出直接子文件夹，按名字排序。每个子文件夹当作一个人。"""
+        folders, token = [], None
+        q = (f"'{folder_id}' in parents "
+             f"and mimeType = 'application/vnd.google-apps.folder' "
+             f"and trashed = false")
+        while True:
+            resp = self.service.files().list(
+                q=q, pageSize=200, pageToken=token, orderBy="name",
+                fields="nextPageToken, files(id,name)",
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ).execute()
+            folders.extend(resp.get("files", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+        return folders
+
+    def list_images_by_person(self, root_id):
+        """
+        扫描根文件夹下的每个子文件夹，返回 [(人名, 图片列表), ...]。
+        直接丢在根目录里的图片归到"未分组"，兼容你之前的用法。
+        """
+        out = []
+        loose = self.list_images(root_id)
+        if loose:
+            out.append(("未分组", loose))
+        for f in self.list_subfolders(root_id):
+            imgs = self.list_images(f["id"])
+            if imgs:
+                out.append((f["name"], imgs))
+        return out
+
     # ---------- 下载图片字节 ----------
     def fetch_image_bytes(self, f, max_px=1400):
         """
