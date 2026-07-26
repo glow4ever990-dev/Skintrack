@@ -150,6 +150,19 @@ with st.sidebar:
     if not sm.face_detection_available():
         st.warning("人脸自动定位不可用，改用中心裁剪。"
                    "请尽量让脸在画面正中、大小一致，否则数据不可比。")
+    with st.expander("清空全部数据"):
+        st.caption("把结果账本清空，下次扫描会把所有照片重新分析一遍。"
+                   "照片本身不会被删。改了文件夹结构、或者旧数据是混着算的，"
+                   "就该清一次。")
+        if st.checkbox("我确认要清空", key="wipe_ok"):
+            if st.button("确认清空", type="secondary", use_container_width=True):
+                if csv_id and save_metrics(client, pd.DataFrame(columns=COLS), csv_id):
+                    st.session_state.df = pd.DataFrame(columns=COLS)
+                    st.success("已清空，现在点上面的扫描按钮重新分析。")
+                    st.rerun()
+                else:
+                    st.error("清空失败：Drive 里找不到 skin_metrics.csv。")
+
     if len(df):
         st.download_button("下载全部数据 (CSV)",
                            df.to_csv(index=False).encode("utf-8-sig"),
