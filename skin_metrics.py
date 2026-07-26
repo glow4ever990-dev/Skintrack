@@ -127,6 +127,7 @@ def decode(image_bytes):
 # ---------------- 对齐 ----------------
 # 标准脸的几何：所有照片都被摆成两眼在这两个固定坐标上。
 # 这样近景、远景、脸偏一点、头歪一点，出来都是同一个姿态。
+COMPARE_SIZE = 1024      # 对比时按这个尺寸对齐，局部放大才不糊
 EYE_Y   = 0.36      # 眼睛所在的高度（占画布比例）
 EYE_LX  = 0.33      # 画面左边那只眼的横坐标
 EYE_RX  = 0.67      # 画面右边那只眼的横坐标
@@ -193,6 +194,31 @@ def _find_eyes(gray, face_rect):
     return (lx + x, ly + off_y), (rx + x, ry + off_y)
 
 
+def _eyes_plausible(eyes, face_rect):
+    """
+    检测器经常把鼻孔、痣、阴影当成眼睛。这类误检的共同特征是
+    两点靠得太近——一旦按它算缩放，整张脸会被放大好几倍，
+    出来就是一片毛孔特写。这里按人脸框的比例做常识检查，
+    不合理就宁可退回粗对齐，也不要一张废图。
+    """
+    (lx, ly), (rx, ry) = eyes
+    x, y, w, h = face_rect
+    dx, dy = rx - lx, ry - ly
+    dist = float(np.hypot(dx, dy))
+
+    # 1) 眼距应当占脸宽的三到六成
+    if not (0.28 * w <= dist <= 0.62 * w):
+        return False
+    # 2) 两眼不该差太高（脸歪超过 25 度基本是误检）
+    if abs(np.degrees(np.arctan2(dy, dx))) > 25:
+        return False
+    # 3) 眼睛该在脸的上半部
+    rel = ((ly + ry) / 2.0 - y) / max(h, 1)
+    if not (0.15 <= rel <= 0.58):
+        return False
+    return True
+
+
 def align_face(img, size=FACE_SIZE):
     """
     把脸摆正到统一姿态，返回 (脸图, 对齐等级)。
@@ -214,7 +240,7 @@ def align_face(img, size=FACE_SIZE):
     # ---- 第一档：靠两眼做相似变换 ----
     if face is not None:
         eyes = _find_eyes(gray, face)
-        if eyes is not None:
+        if eyes is not None and _eyes_plausible(eyes, face):
             (lx, ly), (rx, ry) = eyes
             dx, dy = rx - lx, ry - ly
             dist = float(np.hypot(dx, dy))
@@ -405,16 +431,16 @@ def _refine_align(ref, mov):
         return mov, False
 
 
-def diff_map(bytes_a, bytes_b):
+def diff_map(bytes_a, bytes_b, size=COMPARE_SIZE):
     """
     算两张照片的差异分布。返回一个 dict，后面画图和排名都用它。
     """
-    fa, lvl_a = align_face(decode(bytes_a))
-    fb, lvl_b = align_face(decode(bytes_b))
+    fa, lvl_a = align_face(decode(bytes_a), size)
+    fb, lvl_b = align_face(decode(bytes_b), size)
 
     fb, refined = _refine_align(fa, fb)
 
-    mask = face_mask()
+    mask = face_mask(size)
     la, lb = _match_illumination(fa, fb, mask)
 
     # 差异本身
@@ -466,16 +492,16 @@ def hot_blocks(d, mask, top=3, grid=16, min_gap=2):
 
     boxes = []
     for i, j, v in picked:
-        pad = cell // 2
+        pad = cell          # 上下左右各留一格环境，看得出是脸上哪儿
         x1 = max(0, j * cell - pad); y1 = max(0, i * cell - pad)
         x2 = min(S, (j + 1) * cell + pad); y2 = min(S, (i + 1) * cell + pad)
         boxes.append({"box": (x1, y1, x2, y2), "score": v,
-                      "region": _which_region((x1 + x2) // 2, (y1 + y2) // 2)})
+                      "region": _which_region((x1 + x2) // 2, (y1 + y2) // 2, S)})
     return boxes
 
 
-def _which_region(cx, cy):
-    for name, (x1, y1, x2, y2) in region_boxes().items():
+def _which_region(cx, cy, size=FACE_SIZE):
+    for name, (x1, y1, x2, y2) in region_boxes(size).items():
         if x1 <= cx < x2 and y1 <= cy < y2:
             return name
     return "其他"
@@ -512,12 +538,14 @@ def comparison_image(bytes_a, bytes_b, top=3):
 
     # 下排：局部放大
     if blocks:
-        crop_h = S // 2
+        # 放大倍数封顶 2 倍。超过就纯粹是把像素拉大，只会更糊，看不出更多东西。
+        src_side = max(b["box"][2] - b["box"][0] for b in blocks)
+        crop_h = int(min(S // 2, src_side * 2))
         tiles = []
         for n, b in enumerate(blocks, 1):
             x1, y1, x2, y2 = b["box"]
-            ca = cv2.resize(fa[y1:y2, x1:x2], (crop_h, crop_h), interpolation=cv2.INTER_CUBIC)
-            cb = cv2.resize(fb[y1:y2, x1:x2], (crop_h, crop_h), interpolation=cv2.INTER_CUBIC)
+            ca = cv2.resize(fa[y1:y2, x1:x2], (crop_h, crop_h), interpolation=cv2.INTER_LANCZOS4)
+            cb = cv2.resize(fb[y1:y2, x1:x2], (crop_h, crop_h), interpolation=cv2.INTER_LANCZOS4)
             pair = np.hstack([ca, np.full((crop_h, 4, 3), 255, np.uint8), cb])
             cv2.putText(pair, str(n), (6, 26), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (255, 255, 255), 2, cv2.LINE_AA)
@@ -536,7 +564,7 @@ def comparison_image(bytes_a, bytes_b, top=3):
         merged = top_row
 
     per_region = {}
-    for name, (x1, y1, x2, y2) in region_boxes().items():
+    for name, (x1, y1, x2, y2) in region_boxes(S).items():
         patch = d[y1:y2, x1:x2]
         if patch.size:
             per_region[name] = round(float(patch.mean()), 2)
