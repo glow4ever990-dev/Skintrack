@@ -411,19 +411,31 @@ def _match_illumination(a, b, mask):
 
 def _refine_align(ref, mov):
     """
-    眼睛对齐之后还会剩一点点位移，用 ECC 再磨一次。
-    这一步很关键：差一两个像素，鼻翼、发际线的边缘就会在差异图上
-    亮成一条，看起来像"这里变了"，其实只是没对齐。
-    对不上就原样返回，不影响后续。
+    眼睛对齐之后还会剩残差，用 ECC 再磨。分两步：
+      先欧氏变换（只转+平移）粗对，再仿射变换细对。
+    第二步很重要——两张脸如果竖直比例不一样（比如一张闭眼没对上眼睛、
+    只按脸框缩放），单纯平移旋转救不了，会出现"下巴对得上、
+    眉毛对到眼睛"这种上下错位。仿射能把这个拉伸差修掉。
+    对不上就退回上一步的结果，不会更糟。
     """
     try:
         ga = cv2.cvtColor(ref, cv2.COLOR_BGR2GRAY).astype(np.float32)
         gb = cv2.cvtColor(mov, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        ga = cv2.GaussianBlur(ga, (0, 0), 2.0)
-        gb = cv2.GaussianBlur(gb, (0, 0), 2.0)
+        ga = cv2.GaussianBlur(ga, (0, 0), 2.5)
+        gb = cv2.GaussianBlur(gb, (0, 0), 2.5)
+
         warp = np.eye(2, 3, dtype=np.float32)
-        crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-5)
-        cv2.findTransformECC(ga, gb, warp, cv2.MOTION_EUCLIDEAN, crit, None, 5)
+        ok = False
+        for mode, iters in ((cv2.MOTION_EUCLIDEAN, 60), (cv2.MOTION_AFFINE, 80)):
+            try:
+                crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, iters, 1e-6)
+                cv2.findTransformECC(ga, gb, warp, mode, crit, None, 5)
+                ok = True
+            except Exception:
+                break          # 这一级没收敛就用上一级的结果
+
+        if not ok:
+            return mov, False
         return cv2.warpAffine(mov, warp, mov.shape[1::-1],
                               flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP,
                               borderMode=cv2.BORDER_REPLICATE), True
@@ -546,6 +558,7 @@ def comparison_image(bytes_a, bytes_b, top=3):
             x1, y1, x2, y2 = b["box"]
             ca = cv2.resize(fa[y1:y2, x1:x2], (crop_h, crop_h), interpolation=cv2.INTER_LANCZOS4)
             cb = cv2.resize(fb[y1:y2, x1:x2], (crop_h, crop_h), interpolation=cv2.INTER_LANCZOS4)
+            b["crop_a"], b["crop_b"] = ca, cb
             pair = np.hstack([ca, np.full((crop_h, 4, 3), 255, np.uint8), cb])
             cv2.putText(pair, str(n), (6, 26), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (255, 255, 255), 2, cv2.LINE_AA)

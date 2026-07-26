@@ -323,25 +323,46 @@ with tab3:
                         "下面标出的区块可能只是没对齐造成的假差异，别当真。"
                         "重拍时正对镜头、露出双眼、别戴反光的眼镜，就能对上。")
 
-                st.image(sm.bgr_to_rgb(r["merged"]),
-                         caption="上排：前期 ｜ 后期 ｜ 差异热力（白框内为差异最集中处）　"
-                                 "下排：各标号的局部放大，左前右后",
+                # ---- 全脸三视图 ----
+                st.markdown("#### 全脸")
+                g1, g2, g3 = st.columns(3)
+                g1.image(sm.bgr_to_rgb(r["face_a"]), caption="① 前期（已摆正）",
+                         use_container_width=True)
+                g2.image(sm.bgr_to_rgb(r["face_b"]), caption="② 后期（已摆正）",
+                         use_container_width=True)
+                g3.image(sm.bgr_to_rgb(r["marked"]),
+                         caption="③ 差异热力图：暖色=变化大，蓝色=基本没变。"
+                                 "白框是差异最集中处，框上数字对应下面第几组。",
                          use_container_width=True)
 
-                st.download_button("下载这张对比图",
-                                   sm.to_png_bytes(r["merged"]),
-                                   file_name="对比图.png", mime="image/png")
-
+                # ---- 每个区块单独一行大图 ----
                 if r["blocks"]:
-                    st.markdown("**差异集中区块**")
-                    st.dataframe(
-                        pd.DataFrame(
-                            [{"标号": i, "部位": b_["region"],
-                              "差异强度": round(b_["score"], 2)}
-                             for i, b_ in enumerate(r["blocks"], 1)]),
-                        use_container_width=True, hide_index=True)
+                    st.markdown("#### 差异集中区块（局部放大）")
+                    for i, b_ in enumerate(r["blocks"], 1):
+                        st.markdown(f"**{i}. {b_['region']}**　差异强度 "
+                                    f"{b_['score']:.2f}")
+                        ca, cb = b_.get("crop_a"), b_.get("crop_b")
+                        if ca is None:
+                            continue
+                        k1, k2 = st.columns(2)
+                        k1.image(sm.bgr_to_rgb(ca), caption="前期",
+                                 use_container_width=True)
+                        k2.image(sm.bgr_to_rgb(cb), caption="后期",
+                                 use_container_width=True)
+                        st.download_button(
+                            f"下载第 {i} 组局部图",
+                            sm.to_png_bytes(np.hstack([ca, cb])),
+                            file_name=f"局部_{i}_{b_['region']}.png",
+                            mime="image/png", key=f"dl_blk_{i}")
+                        st.divider()
                 else:
                     st.info("没找出明显集中的差异区块，两张照片整体比较接近。")
+
+                with st.expander("下载合并成一张的对比图"):
+                    st.image(sm.bgr_to_rgb(r["merged"]), use_container_width=True)
+                    st.download_button("下载合并图",
+                                       sm.to_png_bytes(r["merged"]),
+                                       file_name="对比图.png", mime="image/png")
 
                 with st.expander("按区域看平均差异"):
                     st.dataframe(
