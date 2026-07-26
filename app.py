@@ -16,7 +16,7 @@ import skin_metrics as sm
 from drive_client import DriveClient
 
 METRICS_FILE = "skin_metrics.csv"
-COLS = ["person", "file_id", "name", "date", "region", "metric", "value"]
+COLS = ["person", "angle", "file_id", "name", "date", "region", "metric", "value"]
 UNGROUPED = "未分组"
 
 # 方向：+1 表示数值变大 = 变差；-1 表示数值变大 = 变好
@@ -56,7 +56,10 @@ def load_metrics(client, fid):
         df = pd.read_csv(io.StringIO(txt))
         if "person" not in df.columns:      # 旧表没有分人，全部归到未分组
             df["person"] = UNGROUPED
+        if "angle" not in df.columns:
+            df["angle"] = "未标注"
         df["person"] = df["person"].fillna(UNGROUPED)
+        df["angle"] = df["angle"].fillna("未标注")
         df["date"] = pd.to_datetime(df["date"])
         return df[COLS], file_id
     except Exception:
@@ -98,11 +101,13 @@ def sync(client, fid, df, csv_id):
         status.text(f"处理中：{person} / {f['name']}  ({i + 1}/{len(todo)})")
         try:
             raw = client.fetch_image_bytes(f)
-            res = sm.analyze(raw)
+            res = sm.analyze(raw, f["name"])
             d = sm.parse_date(f)
+            ang = res.get("angle", "未标注")
             for region, mets in res["regions"].items():
                 for metric, val in mets.items():
-                    rows.append([person, f["id"], f["name"], d, region, metric, val])
+                    rows.append([person, ang, f["id"], f["name"], d,
+                                 region, metric, val])
             del raw, res          # 立刻释放，内存里始终只有一张图
         except Exception as e:
             failed.append(f"{person} / {f['name']}：{e}")
@@ -186,12 +191,30 @@ else:
 
 df = df[df["person"] == person]
 
+# ---------------- 选角度 ----------------
+# 正脸和侧脸没有可比性，混着比出来的全是"脸转过去了"，不是皮肤变化。
+if "angle" not in df.columns:
+    df["angle"] = "未标注"
+angles = [a for a in sm.ANGLES if a in set(df["angle"])]
+angles += sorted(set(df["angle"]) - set(sm.ANGLES))
+
+if len(angles) > 1:
+    angle = st.sidebar.selectbox("拍摄角度", angles, key="angle_sel")
+else:
+    angle = angles[0] if angles else "未标注"
+    st.sidebar.caption(f"角度：{angle}")
+
+df = df[df["angle"] == angle]
+
 if not len(df):
     st.info("这个对象名下还没有已分析的照片。")
     st.stop()
 
-st.caption(f"当前对象：**{person}**　共 {df['file_id'].nunique()} 张照片"
-           + ("　（只在同一对象内部对比）" if len(people) > 1 else ""))
+st.caption(f"当前：**{person}** ／ **{angle}**　共 {df['file_id'].nunique()} 张"
+           "　（只在同一对象、同一角度内部对比）")
+if angle == "未标注":
+    st.warning("这些照片没有角度标记，程序只能靠自动判断，可能把正脸和侧脸混在一起。"
+               "在文件名里加上「正面」「左90」「右90」「左45」「右45」最可靠。")
 
 photos = (df.groupby(["file_id", "name"])["date"].first()
             .reset_index().sort_values("date"))

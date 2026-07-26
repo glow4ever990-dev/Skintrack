@@ -124,6 +124,112 @@ def decode(image_bytes):
     raise ValueError("无法解码这个格式")
 
 
+# ---------------- Shot angle ----------------
+# The same person is photographed from several angles (front, 45, 90).
+# Comparing a front shot against a profile is meaningless, so every photo
+# carries an angle tag and only same-tag photos are ever compared.
+ANGLES = ["正面", "左45", "右45", "左90", "右90", "未标注"]
+
+_NAME_HINTS = [
+    ("左90", ("左90", "zuo90", "l90", "left90")),
+    ("右90", ("右90", "you90", "r90", "right90")),
+    ("左45", ("左45", "zuo45", "l45", "left45")),
+    ("右45", ("右45", "you45", "r45", "right45")),
+    ("正面", ("正面", "正脸", "zhengmian", "zhenglian", "front")),
+]
+
+
+def angle_from_name(filename):
+    """Read the angle tag out of the file name. Most reliable source:
+    the user controls it, and no detector can be fooled."""
+    low = str(filename).lower()
+    for tag, keys in _NAME_HINTS:
+        if any(k in low for k in keys):
+            return tag
+    return None
+
+
+def guess_angle(img):
+    """Rough fallback when the file name says nothing.
+    Only separates front from side - telling 45 from 90 reliably is not
+    something these detectors can do, so those come from the name only."""
+    h, w = img.shape[:2]
+    scale = min(1.0, 800 / max(h, w))
+    small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale < 1 else img
+    gray = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
+
+    front = _get_cascade()
+    if front is not None:
+        try:
+            if len(front.detectMultiScale(gray, 1.15, 5, minSize=(60, 60))):
+                return "正面"
+        except Exception:
+            pass
+
+    prof = _get_cascade("haarcascade_profileface.xml")
+    if prof is not None:
+        for flip, tag in ((False, "右90"), (True, "左90")):
+            g = cv2.flip(gray, 1) if flip else gray
+            try:
+                if len(prof.detectMultiScale(g, 1.15, 5, minSize=(60, 60))):
+                    return tag
+            except Exception:
+                continue
+    return "未标注"
+
+
+def resolve_angle(img, filename):
+    """File name wins; detector only fills the gap."""
+    return angle_from_name(filename) or guess_angle(img)
+
+
+# ---------------- Skin mask ----------------
+def skin_mask(img, seed_box=None):
+    """Keep skin, drop towel / hair / clothing / background.
+
+    The reference colour is sampled from the photo itself rather than
+    hard-coded, so it adapts to skin tone and lighting. A pale towel sits
+    far enough from real skin in Cr/Cb and saturation to fall outside.
+    """
+    ycc = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    Cr, Cb = ycc[:, :, 1].astype(np.float32), ycc[:, :, 2].astype(np.float32)
+    S, V = hsv[:, :, 1].astype(np.float32), hsv[:, :, 2].astype(np.float32)
+    h, w = img.shape[:2]
+
+    # Seed: centre of the frame, where the face almost always is.
+    seed = np.zeros((h, w), np.uint8)
+    if seed_box:
+        x1, y1, x2, y2 = seed_box
+        seed[y1:y2, x1:x2] = 1
+    else:
+        cv2.ellipse(seed, (w // 2, int(h * 0.52)),
+                    (int(w * 0.20), int(h * 0.24)), 0, 0, 360, 1, -1)
+    sel = (seed > 0) & (S > 30) & (V > 40) & (V < 250)
+    if sel.sum() < 200:
+        sel = seed > 0
+    if sel.sum() < 50:
+        return face_mask(max(h, w))[:h, :w]
+
+    cr0, cb0, s0 = np.median(Cr[sel]), np.median(Cb[sel]), np.median(S[sel])
+
+    m = ((np.abs(Cr - cr0) < 14) & (np.abs(Cb - cb0) < 14)
+         & (S > max(28.0, s0 * 0.45)) & (V > 35) & (V < 252))
+    m = m.astype(np.uint8)
+
+    k = np.ones((7, 7), np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+
+    # Keep only the biggest blob - stray hands or neck patches add noise.
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    if n > 1:
+        big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        m = (lab == big).astype(np.uint8)
+
+    return cv2.GaussianBlur(m.astype(np.float32), (0, 0), max(h, w) * 0.012)
+
+
 # ---------------- 对齐 ----------------
 # 标准脸的几何：所有照片都被摆成两眼在这两个固定坐标上。
 # 这样近景、远景、脸偏一点、头歪一点，出来都是同一个姿态。
@@ -331,11 +437,13 @@ def region_boxes(size=FACE_SIZE):
 
 
 # ---------------- 指标计算 ----------------
-def analyze(image_bytes):
+def analyze(image_bytes, filename=""):
     """
     返回 {区域: {指标: 数值}}，外加整体信息。
+    filename is used to read the angle tag.
     """
     img = decode(image_bytes)
+    angle = resolve_angle(img, filename)
     face, detected = crop_face(img)
 
     # 轻度降噪：手机传感器噪点会把"粗糙度"和"斑点数"顶得很高，
@@ -386,6 +494,7 @@ def analyze(image_bytes):
     return {
         "regions": out,
         "face_detected": detected,
+        "angle": angle,
         "face_image": face,
     }
 
@@ -452,7 +561,12 @@ def diff_map(bytes_a, bytes_b, size=COMPARE_SIZE):
 
     fb, refined = _refine_align(fa, fb)
 
-    mask = face_mask(size)
+    # Intersect both photos' skin masks: only compare pixels that are skin
+    # in BOTH shots, otherwise a towel that moved shows up as a huge change.
+    mask = np.minimum(skin_mask(fa), skin_mask(fb))
+    mask = np.minimum(mask, face_mask(size) * 0 + 1.0)
+    if mask.mean() < 0.04:                 # masking went wrong - fall back
+        mask = face_mask(size)
     la, lb = _match_illumination(fa, fb, mask)
 
     # 差异本身
